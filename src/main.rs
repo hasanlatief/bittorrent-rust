@@ -4,9 +4,9 @@ use nom::{
     IResult, Parser,
     bytes::complete::take,
     character::complete::{char, digit1},
+    combinator::{opt, recognize},
     sequence::delimited,
 };
-use serde_json::Number;
 
 // Available if you need it!
 // use serde_bencode
@@ -29,7 +29,9 @@ fn parse_string(s: &str) -> IResult<&str, &str> {
 }
 
 fn parse_number<I: FromStr>(s: &str) -> IResult<&str, I> {
-    digit1.map_res(str::parse::<I>).parse(s)
+    recognize((opt(char('-')), digit1))
+        .map_res(str::parse::<I>)
+        .parse(s)
 }
 
 fn parse_ben_integer(s: &str) -> IResult<&str, i64> {
