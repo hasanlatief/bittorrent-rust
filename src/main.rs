@@ -5,7 +5,7 @@ use nom::{
     bytes::complete::take,
     character::complete::{char, digit1},
     combinator::{opt, recognize},
-    sequence::delimited,
+    sequence::{delimited, preceded},
 };
 
 // Available if you need it!
@@ -25,7 +25,7 @@ fn decode_bencoded_value(encoded_value: &str) -> serde_json::Value {
 
 fn parse_string(s: &str) -> IResult<&str, &str> {
     let (rest, len) = parse_number::<usize>(s)?;
-    (char(':'), take(len)).map(|(_, s)| s).parse(rest)
+    preceded(char(':'), take(len)).parse(rest)
 }
 
 fn parse_number<I: FromStr>(s: &str) -> IResult<&str, I> {
