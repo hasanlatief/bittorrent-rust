@@ -1,21 +1,25 @@
 #![feature(string_from_utf8_lossy_owned)]
-use std::{env, net::SocketAddrV4, path::Path, str::FromStr};
+use std::{net::SocketAddrV4, path::Path, str::FromStr};
 
 use nom::{
     IResult, Parser as _,
-    bytes::streaming::{tag, take},
+    bytes::streaming::take,
     character::{char, complete::digit1},
     combinator::{opt, recognize},
-    sequence::preceded,
 };
 use sha1::{Digest, Sha1};
 
 use percent_encoding::{NON_ALPHANUMERIC, percent_encode};
 
 use anyhow::{Context as _, anyhow};
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 
+use crate::cli::Command;
+
 mod bencode;
+
+mod cli;
 
 fn parse_number<I: FromStr>(s: &[u8]) -> IResult<&[u8], I> {
     recognize((opt(char('-')), digit1))
@@ -86,6 +90,44 @@ impl TorrentInfo {
             info_hash,
         })
     }
+
+    async fn tracker_peers(&self) -> anyhow::Result<TrackerResponse> {
+        let client = reqwest::Client::new();
+
+        let encoded_hash = percent_encode(&self.info_hash, NON_ALPHANUMERIC).to_string();
+
+        let query_str = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("peer_id", str::from_utf8(&PEER_ID).unwrap())
+            .append_pair("port", "6881")
+            .append_pair("uploaded", "0")
+            .append_pair("downloaded", "0")
+            .append_pair("left", &self.length.to_string())
+            .append_pair("compact", "1")
+            .finish();
+
+        let url = format!("{}?info_hash={}&{}", self.announce, encoded_hash, query_str);
+
+        let response = client.get(url).send().await?.bytes().await?;
+        let map = bencode::parse(&response)?
+            .try_into_dict()
+            .context("Missing peers in response")?;
+        let peers = map
+            .get(PEERS)
+            .and_then(|v| v.as_string())
+            .context("Missing peers in response")?;
+        Ok(TrackerResponse {
+            peers: peers
+                .as_chunks::<6>()
+                .0
+                .iter()
+                .map(|bytes| {
+                    let ip = bytes[0..4].as_array().copied().unwrap().into();
+                    let port = u16::from_be_bytes([bytes[4], bytes[5]]);
+                    SocketAddrV4::new(ip, port)
+                })
+                .collect(),
+        })
+    }
 }
 
 fn print_torrent_summary(val: TorrentInfo) -> anyhow::Result<()> {
@@ -125,47 +167,6 @@ struct TrackerResponse {
 const PEER_ID: [u8; 20] = *b"idkICanPickAnything!";
 const EXTENSIONS: [u8; 8] = [0; 8];
 
-async fn tracker_get_request(torrent: &TorrentInfo) -> anyhow::Result<TrackerResponse> {
-    let client = reqwest::Client::new();
-
-    let encoded_hash = percent_encode(&torrent.info_hash, NON_ALPHANUMERIC).to_string();
-
-    let query_str = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("peer_id", str::from_utf8(&PEER_ID).unwrap())
-        .append_pair("port", "6881")
-        .append_pair("uploaded", "0")
-        .append_pair("downloaded", "0")
-        .append_pair("left", &torrent.length.to_string())
-        .append_pair("compact", "1")
-        .finish();
-
-    let url = format!(
-        "{}?info_hash={}&{}",
-        torrent.announce, encoded_hash, query_str
-    );
-
-    let response = client.get(url).send().await?.bytes().await?;
-    let map = bencode::parse(&response)?
-        .try_into_dict()
-        .context("Missing peers in response")?;
-    let peers = map
-        .get(PEERS)
-        .and_then(|v| v.as_string())
-        .context("Missing peers in response")?;
-    Ok(TrackerResponse {
-        peers: peers
-            .as_chunks::<6>()
-            .0
-            .iter()
-            .map(|bytes| {
-                let ip = bytes[0..4].as_array().copied().unwrap().into();
-                let port = u16::from_be_bytes([bytes[4], bytes[5]]);
-                SocketAddrV4::new(ip, port)
-            })
-            .collect(),
-    })
-}
-
 fn read_torrent_file(path: impl AsRef<Path>) -> anyhow::Result<TorrentInfo> {
     let torrent_bytes = std::fs::read(path.as_ref())?;
     TorrentInfo::new(bencode::parse(&torrent_bytes)?)
@@ -188,54 +189,78 @@ impl PeerInfo {
         result.extend_from_slice(&self.id);
         result
     }
-}
 
-fn parse_handshake(bytes: &[u8]) -> IResult<&[u8], PeerInfo> {
-    let (rest, protcol_str_len) = take(1_usize).map(|s: &[u8]| s[0]).parse(bytes)?;
-    let (rest, protocol) = take(protcol_str_len)
-        .map_res(|protcol_bytes: &[u8]| String::from_utf8(protcol_bytes.to_vec()))
-        .parse(rest)?;
-    let (rest, (extension, info_hash, peer_id)) =
-        (take(8_usize), take(20_usize), take(20_usize)).parse(rest)?;
-    Ok((
-        rest,
-        PeerInfo {
-            id: *peer_id.as_array().unwrap(),
-            info_hash: *info_hash.as_array().unwrap(),
-            protocol,
-            extension: *extension.as_array().unwrap(),
-        },
-    ))
+    fn parse(bytes: &[u8]) -> IResult<&[u8], PeerInfo> {
+        let (rest, protcol_str_len) = take(1_usize).map(|s: &[u8]| s[0]).parse(bytes)?;
+        let (rest, protocol) = take(protcol_str_len)
+            .map_res(|protcol_bytes: &[u8]| String::from_utf8(protcol_bytes.to_vec()))
+            .parse(rest)?;
+        let (rest, (extension, info_hash, peer_id)) =
+            (take(8_usize), take(20_usize), take(20_usize)).parse(rest)?;
+        Ok((
+            rest,
+            PeerInfo {
+                id: *peer_id.as_array().unwrap(),
+                info_hash: *info_hash.as_array().unwrap(),
+                protocol,
+                extension: *extension.as_array().unwrap(),
+            },
+        ))
+    }
+
+    async fn parse_from_connection<R: tokio::io::AsyncRead + Unpin>(
+        reader: &mut R,
+    ) -> anyhow::Result<Self> {
+        let mut buf = Vec::new();
+        loop {
+            let n = reader.read_buf(&mut buf).await?;
+            if n == 0 {
+                return Err(anyhow!(
+                    "Peer prematurely closed connection during handshake"
+                ));
+            }
+            match Self::parse(&buf) {
+                Ok((_, v)) => break Ok(v),
+                Err(e) => match e {
+                    nom::Err::Incomplete(_) => {
+                        continue;
+                    }
+                    nom::Err::Error(e) | nom::Err::Failure(e) => {
+                        return Err(anyhow!("Failed to parse handshake from peer {:?}", e));
+                    }
+                },
+            }
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = env::args().collect();
-    let command = args[1].as_str();
+    let command = cli::get_args();
 
     match command {
-        "decode" => {
-            let encoded_value = args[2].as_bytes();
+        Command::Decode(args) => {
+            let encoded_value = args.bencoded.as_bytes();
             let decoded_value: serde_json::Value = bencode::parse(encoded_value)?.into();
             println!("{}", decoded_value);
         }
-        "info" => {
-            let torrent = read_torrent_file(&args[2])?;
+        Command::Info(args) => {
+            let torrent = read_torrent_file(args.torrent_path)?;
             print_torrent_summary(torrent)?;
         }
-        "peers" => {
-            let torrent = read_torrent_file(&args[2])?;
-            let response = tracker_get_request(&torrent).await?;
+        Command::Peers(args) => {
+            let torrent = read_torrent_file(args.torrent_path)?;
+            let response = torrent.tracker_peers().await?;
             for peer in response.peers {
                 let ip = peer.ip();
                 let port = peer.port();
                 println!("{ip}:{port}")
             }
         }
-        "handshake" => {
-            let torrent = read_torrent_file(&args[2])?;
+        Command::Handshake(args) => {
+            let torrent = read_torrent_file(args.torrent_path)?;
             let (peer_read, peer_write) = tokio::net::TcpSocket::new_v4()?
-                .connect(args[3].parse()?)
+                .connect(args.peer)
                 .await?
                 .into_split();
             let mut peer_read = BufReader::new(peer_read);
@@ -248,33 +273,14 @@ async fn main() -> anyhow::Result<()> {
             };
             peer_write.write_all(&self_info.as_handshake()).await?;
             peer_write.flush().await?;
-            let mut buf = Vec::new();
-            let peer = loop {
-                let n = peer_read.read_buf(&mut buf).await?;
-                if n == 0 {
-                    return Err(anyhow!(
-                        "Peer prematurely closed connection during handshake"
-                    ));
-                }
-                match parse_handshake(&buf) {
-                    Ok((_, v)) => break v,
-                    Err(e) => match e {
-                        nom::Err::Incomplete(_) => {
-                            continue;
-                        }
-                        nom::Err::Error(e) | nom::Err::Failure(e) => {
-                            return Err(anyhow!("Failed to parse handshake from peer {:?}", e));
-                        }
-                    },
-                }
-            };
+            let peer = PeerInfo::parse_from_connection(&mut peer_read).await?;
             print!("Peer ID: ");
             for byte in peer.id {
                 print!("{byte:02x}");
             }
             println!()
         }
-        _ => println!("unknown command: {}", args[1]),
+        Command::DownloadPiece(args) => todo!(),
     }
     Ok(())
 }
