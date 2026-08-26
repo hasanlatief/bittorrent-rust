@@ -2,15 +2,21 @@ use nom::{
     IResult, Parser as _,
     branch::alt,
     bytes::complete::take,
-    character::complete::char,
+    character::complete::{char, digit1},
+    combinator::{opt, recognize},
     multi::{fold_many0, many0},
     sequence::{delimited, preceded},
 };
 
-use std::{collections::BTreeMap, io::Write};
+use std::{collections::BTreeMap, io::Write, str::FromStr};
 
-use super::parse_number;
-
+fn parse_number<I: FromStr>(s: &[u8]) -> IResult<&[u8], I> {
+    recognize((opt(char('-')), digit1))
+        // SAFETY: The parser only maps if it matches [-0-9] which are all ASCII and valid UTF8
+        .map(|bytes| unsafe { str::from_utf8_unchecked(bytes) })
+        .map_res(str::parse::<I>)
+        .parse(s)
+}
 #[derive(Debug)]
 pub(crate) enum Value {
     String(Vec<u8>),
@@ -148,14 +154,12 @@ fn parse_ben_integer(s: &[u8]) -> IResult<&[u8], Value> {
         .parse(s)
 }
 
-// The trait bounds of foldmany0 require the initializer to be an FnMut, idk why
-#[allow(clippy::redundant_closure)]
 fn parse_dict(s: &[u8]) -> IResult<&[u8], Value> {
     delimited(
         char('d'),
         fold_many0(
             (parse_string, parse_bencoded_value),
-            || BTreeMap::new(),
+            BTreeMap::new,
             |mut map, (new_key, new_val)| {
                 let s = new_key.try_into_string().unwrap();
                 map.insert(s, new_val);
