@@ -257,6 +257,7 @@ dependencies = [
  "bytes",
  "clap",
  "hex",
+ "libc",
  "nom",
  "percent-encoding",
  "regex",

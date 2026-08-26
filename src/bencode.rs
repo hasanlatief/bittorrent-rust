@@ -36,13 +36,13 @@ impl Value {
         }
     }
 
-    pub fn try_into_list(self) -> Option<Vec<Value>> {
-        if let Self::List(v) = self {
-            Some(v)
-        } else {
-            None
-        }
-    }
+    // pub fn try_into_list(self) -> Option<Vec<Value>> {
+    //     if let Self::List(v) = self {
+    //         Some(v)
+    //     } else {
+    //         None
+    //     }
+    // }
 
     pub fn try_into_dict(self) -> Option<BTreeMap<Vec<u8>, Value>> {
         if let Self::Dict(v) = self {
@@ -92,29 +92,29 @@ impl Value {
         }
     }
 
-    pub fn as_integer(&self) -> Option<&i64> {
-        if let Self::Integer(v) = self {
-            Some(v)
-        } else {
-            None
-        }
-    }
+    // pub fn as_integer(&self) -> Option<&i64> {
+    //     if let Self::Integer(v) = self {
+    //         Some(v)
+    //     } else {
+    //         None
+    //     }
+    // }
 
-    pub fn as_list(&self) -> Option<&Vec<Value>> {
-        if let Self::List(v) = self {
-            Some(v)
-        } else {
-            None
-        }
-    }
+    // pub fn as_list(&self) -> Option<&Vec<Value>> {
+    //     if let Self::List(v) = self {
+    //         Some(v)
+    //     } else {
+    //         None
+    //     }
+    // }
 
-    pub fn as_dict(&self) -> Option<&BTreeMap<Vec<u8>, Value>> {
-        if let Self::Dict(v) = self {
-            Some(v)
-        } else {
-            None
-        }
-    }
+    // pub fn as_dict(&self) -> Option<&BTreeMap<Vec<u8>, Value>> {
+    //     if let Self::Dict(v) = self {
+    //         Some(v)
+    //     } else {
+    //         None
+    //     }
+    // }
 }
 
 impl From<Value> for serde_json::Value {

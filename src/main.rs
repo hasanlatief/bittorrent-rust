@@ -1,5 +1,11 @@
 #![feature(string_from_utf8_lossy_owned)]
-use std::{net::SocketAddrV4, path::Path, str::FromStr};
+
+use std::{
+    io::Write,
+    net::{SocketAddr, SocketAddrV4},
+    path::Path,
+    str::FromStr,
+};
 
 use nom::{
     IResult, Parser as _,
@@ -11,15 +17,23 @@ use sha1::{Digest, Sha1};
 
 use percent_encoding::{NON_ALPHANUMERIC, percent_encode};
 
-use anyhow::{Context as _, anyhow};
+use anyhow::Context as _;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
-
-use crate::cli::Command;
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
+    net::tcp::{OwnedReadHalf, OwnedWriteHalf},
+};
 
 mod bencode;
 
+mod message;
+
+use message::{BitfieldMsg, Message, RequestMsg};
+
 mod cli;
+use cli::Command;
+
+use crate::message::PieceMsg;
 
 fn parse_number<I: FromStr>(s: &[u8]) -> IResult<&[u8], I> {
     recognize((opt(char('-')), digit1))
@@ -35,16 +49,17 @@ const ANNOUNCE: &[u8] = b"announce";
 const PIECE_LENGTH: &[u8] = b"piece length";
 const PIECES: &[u8] = b"pieces";
 const NAME: &[u8] = b"name";
-const INTERVAL: &[u8] = b"interval";
+// const INTERVAL: &[u8] = b"interval";
 const PEERS: &[u8] = b"peers";
 
+const MAX_BLOCK_SIZE: u32 = 1024 * 16;
 struct TorrentInfo {
     announce: String,
-    length: usize,
     name: Option<String>,
-    piece_length: usize,
-    piece_hashes: Vec<u8>,
-    info_hash: [u8; 20],
+    length: u32,
+    piece_len: u32,
+    piece_hashes: Vec<[u8; HASH_LEN]>,
+    info_hash: [u8; HASH_LEN],
 }
 
 impl TorrentInfo {
@@ -55,7 +70,7 @@ impl TorrentInfo {
             .and_then(|v| v.try_into_string())
             .context("Missing announce")?
             .try_into()?;
-        let mut info_hash = [0; 20];
+        let mut info_hash = [0; HASH_LEN];
         let mut info = map
             .remove(INFO)
             .inspect(|v| {
@@ -72,11 +87,23 @@ impl TorrentInfo {
             .remove(NAME)
             .and_then(|v| v.try_into_string())
             .and_then(|s| String::from_utf8(s).ok());
-        let piece_hashes = info
+        let mut piece_hashes_bytes = info
             .remove(PIECES)
             .and_then(|v| v.try_into_string())
             .context("Missing pieces")?;
-        let piece_length = info
+        anyhow::ensure!(
+            piece_hashes_bytes.len() % HASH_LEN == 0,
+            "Torrent piece hashes were incomplete."
+        );
+        let piece_hashes = unsafe {
+            Vec::from_raw_parts(
+                piece_hashes_bytes.as_mut_ptr().cast(),
+                piece_hashes_bytes.len() / HASH_LEN,
+                piece_hashes_bytes.capacity() / HASH_LEN,
+            )
+        };
+        std::mem::forget(piece_hashes_bytes);
+        let piece_len = info
             .remove(PIECE_LENGTH)
             .and_then(|v| v.try_into_integer())
             .context("Missing piece length")?
@@ -85,15 +112,45 @@ impl TorrentInfo {
             announce,
             length,
             name,
-            piece_length,
+            piece_len,
             piece_hashes,
             info_hash,
         })
     }
 
-    async fn tracker_peers(&self) -> anyhow::Result<TrackerResponse> {
-        let client = reqwest::Client::new();
+    fn self_peer_info(&self) -> PeerInfo {
+        PeerInfo {
+            id: PEER_ID,
+            info_hash: self.info_hash,
+            protocol: String::from(PROTOCOL),
+            extension: EXTENSIONS,
+        }
+    }
+    fn piece_len(&self, piece_index: u32) -> u32 {
+        let num_pieces = self.piece_hashes.len() as u32;
+        if piece_index == num_pieces - 1 {
+            let full_pieces_len = self.piece_len * (num_pieces - 1);
+            self.length - full_pieces_len
+        } else {
+            self.piece_len
+        }
+    }
 
+    async fn handshake_with(&self, ip: impl Into<SocketAddr>) -> anyhow::Result<Peer> {
+        let (peer_read, peer_write) = tokio::net::TcpSocket::new_v4()?
+            .connect(ip.into())
+            .await?
+            .into_split();
+        let self_info = self.self_peer_info();
+        let mut read = BufReader::new(peer_read);
+        let mut write = BufWriter::new(peer_write);
+        write.write_all(&self_info.as_handshake()).await?;
+        write.flush().await?;
+        let info = PeerInfo::parse_from_connection(&mut read).await?;
+        Ok(Peer { info, read, write })
+    }
+
+    async fn tracker_peers(&self) -> anyhow::Result<TrackerResponse> {
         let encoded_hash = percent_encode(&self.info_hash, NON_ALPHANUMERIC).to_string();
 
         let query_str = url::form_urlencoded::Serializer::new(String::new())
@@ -104,9 +161,10 @@ impl TorrentInfo {
             .append_pair("left", &self.length.to_string())
             .append_pair("compact", "1")
             .finish();
+        let announce = &self.announce;
+        let url = format!("{announce}?info_hash={encoded_hash}&{query_str}");
 
-        let url = format!("{}?info_hash={}&{}", self.announce, encoded_hash, query_str);
-
+        let client = reqwest::Client::new();
         let response = client.get(url).send().await?.bytes().await?;
         let map = bencode::parse(&response)?
             .try_into_dict()
@@ -121,7 +179,7 @@ impl TorrentInfo {
                 .0
                 .iter()
                 .map(|bytes| {
-                    let ip = bytes[0..4].as_array().copied().unwrap().into();
+                    let ip = [bytes[0], bytes[1], bytes[2], bytes[3]].into();
                     let port = u16::from_be_bytes([bytes[4], bytes[5]]);
                     SocketAddrV4::new(ip, port)
                 })
@@ -130,12 +188,12 @@ impl TorrentInfo {
     }
 }
 
-fn print_torrent_summary(val: TorrentInfo) -> anyhow::Result<()> {
+fn print_torrent_summary(val: TorrentInfo) {
     let TorrentInfo {
         announce,
         length,
         name: _,
-        piece_length,
+        piece_len: piece_length,
         piece_hashes,
         info_hash,
     } = val;
@@ -147,36 +205,36 @@ fn print_torrent_summary(val: TorrentInfo) -> anyhow::Result<()> {
     }
     println!();
     println!("Piece Length: {piece_length}");
-    let (chunks, rem) = piece_hashes.as_chunks::<20>();
-    if !rem.is_empty() {
-        return Err(anyhow!("Piece hashes length was not a multiple of 20"));
-    }
-    for hash in chunks {
+    for hash in piece_hashes {
         for byte in hash {
             print!("{byte:02x}");
         }
         println!();
     }
-    Ok(())
 }
-
-struct TrackerResponse {
-    peers: Vec<SocketAddrV4>,
-}
-
-const PEER_ID: [u8; 20] = *b"idkICanPickAnything!";
-const EXTENSIONS: [u8; 8] = [0; 8];
 
 fn read_torrent_file(path: impl AsRef<Path>) -> anyhow::Result<TorrentInfo> {
     let torrent_bytes = std::fs::read(path.as_ref())?;
     TorrentInfo::new(bencode::parse(&torrent_bytes)?)
 }
 
+struct TrackerResponse {
+    peers: Vec<SocketAddrV4>,
+}
+
+const PEER_ID_LEN: usize = 20;
+const PEER_ID: [u8; PEER_ID_LEN] = *b"idkICanPickAnything!";
+
+const EXTENSION_LEN: usize = 8;
+const EXTENSIONS: [u8; EXTENSION_LEN] = [0; EXTENSION_LEN];
+const PROTOCOL: &str = "BitTorrent protocol";
+
+const HASH_LEN: usize = 20;
 struct PeerInfo {
-    id: [u8; 20],
-    info_hash: [u8; 20],
+    id: [u8; PEER_ID_LEN],
+    info_hash: [u8; HASH_LEN],
     protocol: String,
-    extension: [u8; 8],
+    extension: [u8; EXTENSION_LEN],
 }
 
 impl PeerInfo {
@@ -196,7 +254,7 @@ impl PeerInfo {
             .map_res(|protcol_bytes: &[u8]| String::from_utf8(protcol_bytes.to_vec()))
             .parse(rest)?;
         let (rest, (extension, info_hash, peer_id)) =
-            (take(8_usize), take(20_usize), take(20_usize)).parse(rest)?;
+            (take(EXTENSION_LEN), take(HASH_LEN), take(PEER_ID_LEN)).parse(rest)?;
         Ok((
             rest,
             PeerInfo {
@@ -208,25 +266,26 @@ impl PeerInfo {
         ))
     }
 
-    async fn parse_from_connection<R: tokio::io::AsyncRead + Unpin>(
+    async fn parse_from_connection<R: tokio::io::AsyncBufRead + Unpin>(
         reader: &mut R,
     ) -> anyhow::Result<Self> {
-        let mut buf = Vec::new();
         loop {
-            let n = reader.read_buf(&mut buf).await?;
-            if n == 0 {
-                return Err(anyhow!(
-                    "Peer prematurely closed connection during handshake"
-                ));
+            let buf = reader.fill_buf().await?;
+            if buf.is_empty() {
+                anyhow::bail!("Peer prematurely closed connection during handshake");
             }
-            match Self::parse(&buf) {
-                Ok((_, v)) => break Ok(v),
+            match Self::parse(buf) {
+                Ok((rest, v)) => {
+                    let consumed = buf.len() - rest.len();
+                    reader.consume(consumed);
+                    return Ok(v);
+                }
                 Err(e) => match e {
                     nom::Err::Incomplete(_) => {
                         continue;
                     }
                     nom::Err::Error(e) | nom::Err::Failure(e) => {
-                        return Err(anyhow!("Failed to parse handshake from peer {:?}", e));
+                        anyhow::bail!("Failed to parse handshake from peer {e:?}");
                     }
                 },
             }
@@ -234,10 +293,58 @@ impl PeerInfo {
     }
 }
 
+struct Peer {
+    info: PeerInfo,
+    read: BufReader<OwnedReadHalf>,
+    write: BufWriter<OwnedWriteHalf>,
+}
+
+impl Peer {
+    async fn recv(&mut self) -> anyhow::Result<Message> {
+        let len = self.read.read_u32().await? - 1; // -1 for the kind byte
+        let kind_num = self.read.read_u8().await?;
+        let mut reader = (&mut self.read).take(len as u64);
+        Ok(match kind_num {
+            0 => Message::Choke,
+            1 => Message::Unchoke,
+            2 => Message::Interested,
+            3 => Message::NotInterested,
+            4 => todo!(),
+            5 => Message::Bitfield(
+                BitfieldMsg::parse(&mut reader)
+                    .await
+                    .context("Failed to parse bitfield message")?,
+            ),
+            6 => Message::Request(
+                RequestMsg::parse(&mut reader)
+                    .await
+                    .context("Failed to parse request message")?,
+            ),
+            7 => Message::Piece(
+                PieceMsg::parse(&mut reader)
+                    .await
+                    .context("Failed to parse piece message")?,
+            ),
+            8 => todo!(),
+            id => anyhow::bail!("The message id byte ({id}) was outside the supported range."),
+        })
+    }
+
+    async fn send(&mut self, msg: Message) -> anyhow::Result<()> {
+        let len: u32 = msg.len();
+        self.write.write_u32(len).await?;
+        self.write.write_u8(msg.id()).await?;
+        self.write.write_all(&msg.payload()).await?;
+        Ok(())
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let command = cli::get_args();
-
+    let command = cli::parse();
+    unsafe {
+        libc::dup2(libc::STDOUT_FILENO, libc::STDERR_FILENO);
+    }
     match command {
         Command::Decode(args) => {
             let encoded_value = args.bencoded.as_bytes();
@@ -246,7 +353,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Info(args) => {
             let torrent = read_torrent_file(args.torrent_path)?;
-            print_torrent_summary(torrent)?;
+            print_torrent_summary(torrent);
         }
         Command::Peers(args) => {
             let torrent = read_torrent_file(args.torrent_path)?;
@@ -259,28 +366,83 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Handshake(args) => {
             let torrent = read_torrent_file(args.torrent_path)?;
-            let (peer_read, peer_write) = tokio::net::TcpSocket::new_v4()?
-                .connect(args.peer)
-                .await?
-                .into_split();
-            let mut peer_read = BufReader::new(peer_read);
-            let mut peer_write = BufWriter::new(peer_write);
-            let self_info = PeerInfo {
-                id: PEER_ID,
-                info_hash: torrent.info_hash,
-                protocol: String::from("BitTorrent protocol"),
-                extension: EXTENSIONS,
-            };
-            peer_write.write_all(&self_info.as_handshake()).await?;
-            peer_write.flush().await?;
-            let peer = PeerInfo::parse_from_connection(&mut peer_read).await?;
+            let peer = torrent.handshake_with(args.peer).await?;
             print!("Peer ID: ");
-            for byte in peer.id {
+            for byte in peer.info.id {
                 print!("{byte:02x}");
             }
             println!()
         }
-        Command::DownloadPiece(args) => todo!(),
+        Command::DownloadPiece(args) => {
+            let torrent = read_torrent_file(args.torrent_path)?;
+            let mut output_file = std::fs::File::create(args.output_file_path)?;
+            let piece_len = torrent.piece_len(args.piece_index);
+            let response = torrent.tracker_peers().await?;
+            let peer_ip = response.peers[0]; // use the first peer
+            let mut peer = torrent.handshake_with(peer_ip).await?;
+            println!("Waiting for bitfield.");
+            match peer.recv().await {
+                Ok(msg) => match msg {
+                    Message::Bitfield(_) => (), // Do nothing for now since we are guaranteed all peers have all pieces
+                    m => anyhow::bail!("Received an unexpected message: {m:?}"),
+                },
+                Err(e) => anyhow::bail!("Failed to receive bitfield message: {e}."),
+            }
+            println!("Sending interested message.");
+            peer.send(Message::Interested).await?;
+            peer.write.flush().await?;
+            println!("Waiting for unchoke message.");
+            match peer.recv().await {
+                Ok(msg) => match dbg!(&msg) {
+                    Message::Unchoke => (),
+                    m => anyhow::bail!("Received an unexpected message: {m:?}"),
+                },
+                Err(e) => anyhow::bail!("Failed to receive unchoke message: {e}"),
+            }
+            println!("Requesting pieces.");
+            let mut byte_idx = 0;
+            let remainder_block_size = piece_len % MAX_BLOCK_SIZE;
+            while byte_idx < piece_len - remainder_block_size {
+                peer.send(Message::Request(RequestMsg::new(
+                    args.piece_index,
+                    byte_idx,
+                    MAX_BLOCK_SIZE,
+                )))
+                .await?;
+                byte_idx += MAX_BLOCK_SIZE;
+            }
+            if remainder_block_size > 0 {
+                peer.send(Message::Request(RequestMsg::new(
+                    args.piece_index,
+                    piece_len - remainder_block_size,
+                    remainder_block_size,
+                )))
+                .await?;
+            }
+            peer.write.flush().await?;
+            println!("Receiving piece.");
+            let mut data = vec![0; piece_len as usize];
+            let mut blocks_received = 0;
+            let block_count = piece_len.div_ceil(MAX_BLOCK_SIZE);
+            while blocks_received < block_count {
+                match peer
+                    .recv()
+                    .await
+                    .context("Something went wrong while waiting for a piece")?
+                {
+                    Message::Piece(piece) => {
+                        let block = piece.block();
+                        data[(piece.byte_idx() as usize)..][..block.len()].copy_from_slice(block);
+                        blocks_received += 1;
+                    }
+                    msg => {
+                        eprintln!("Unexpected message while downloading piece: {msg:?}");
+                        continue;
+                    }
+                }
+            }
+            output_file.write_all(&data)?;
+        }
     }
     Ok(())
 }

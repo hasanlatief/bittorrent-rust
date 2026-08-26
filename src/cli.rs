@@ -1,6 +1,6 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddrV4, path::PathBuf};
 
-use clap::Parser as _;
+use clap::{Args, Parser as _};
 
 #[derive(clap::Parser)]
 pub struct Cli {
@@ -18,35 +18,35 @@ pub enum Command {
     DownloadPiece(DownloadPieceArgs),
 }
 
-#[derive(clap::Args)]
+#[derive(Args)]
 pub struct DecodeArgs {
     pub bencoded: String,
 }
 
-#[derive(clap::Args)]
+#[derive(Args)]
 pub struct InfoArgs {
     pub torrent_path: PathBuf,
 }
 
-#[derive(clap::Args)]
+#[derive(Args)]
 pub struct PeersArgs {
     pub torrent_path: PathBuf,
 }
 
-#[derive(clap::Args)]
+#[derive(Args)]
 pub struct HandshakeArgs {
     pub torrent_path: PathBuf,
-    pub peer: SocketAddr,
+    pub peer: SocketAddrV4,
 }
 
-#[derive(clap::Args)]
+#[derive(Args)]
 pub struct DownloadPieceArgs {
     #[arg(short = 'o')]
     pub output_file_path: PathBuf,
     pub torrent_path: PathBuf,
-    pub piece_index: u64,
+    pub piece_index: u32,
 }
 
-pub fn get_args() -> Command {
+pub fn parse() -> Command {
     Cli::parse().command
 }
