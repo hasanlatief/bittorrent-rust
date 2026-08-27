@@ -6,6 +6,7 @@ use nom::{IResult, Parser as _, bytes::streaming::take};
 
 use anyhow::Context as _;
 
+use sha1::Digest as _;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
     net::tcp::{OwnedReadHalf, OwnedWriteHalf},
@@ -156,6 +157,85 @@ impl Peer {
         let info = PeerInfo::parse_from_connection(&mut read).await?;
         Ok(Peer { info, read, write })
     }
+    async fn download_piece(
+        &mut self,
+        torrent: &TorrentInfo,
+        piece_idx: u32,
+    ) -> anyhow::Result<Vec<u8>> {
+        let piece_len = torrent.piece_len(piece_idx);
+        match self
+            .recv()
+            .await
+            .context("Failed to receive bitfield message.")?
+        {
+            Message::Bitfield(_) => (), // Do nothing for now since we are guaranteed all peers have all pieces
+            m => anyhow::bail!("Received an unexpected message: {m:?}"),
+        }
+        self.send(Message::Interested).await?;
+        match self
+            .recv()
+            .await
+            .context("Failed to receive unchoke message: {e}")?
+        {
+            Message::Unchoke => (),
+            m => anyhow::bail!("Received an unexpected message: {m:?}"),
+        }
+        self.request_all_blocks(piece_idx, piece_len).await?;
+        let piece = self.download_all_blocks(piece_len).await?;
+        let piece_hash: [u8; HASH_LEN] = sha1::Sha1::digest(&piece).into();
+        anyhow::ensure!(
+            piece_hash == torrent.piece_hash(piece_idx),
+            "Piece hash did not match torrent file."
+        );
+        Ok(piece)
+    }
+
+    async fn download_all_blocks(&mut self, piece_len: u32) -> anyhow::Result<Vec<u8>> {
+        let mut data = vec![0; piece_len as usize];
+        let mut blocks_received = 0;
+        let block_count = piece_len.div_ceil(MAX_BLOCK_SIZE);
+        while blocks_received < block_count {
+            match self
+                .recv()
+                .await
+                .context("Something went wrong while downloading a piece")?
+            {
+                Message::Piece(piece) => {
+                    let block = piece.block();
+                    data[(piece.byte_idx() as usize)..][..block.len()].copy_from_slice(block);
+                    blocks_received += 1;
+                }
+                msg => {
+                    eprintln!("Unexpected message while downloading piece: {msg:?}");
+                    continue;
+                }
+            }
+        }
+        Ok(data)
+    }
+
+    async fn request_all_blocks(&mut self, piece_idx: u32, piece_len: u32) -> anyhow::Result<()> {
+        let mut byte_idx = 0;
+        let remainder_block_size = piece_len % MAX_BLOCK_SIZE;
+        while byte_idx < piece_len - remainder_block_size {
+            self.send(Message::Request(RequestMsg::new(
+                piece_idx,
+                byte_idx,
+                MAX_BLOCK_SIZE,
+            )))
+            .await?;
+            byte_idx += MAX_BLOCK_SIZE;
+        }
+        if remainder_block_size > 0 {
+            self.send(Message::Request(RequestMsg::new(
+                piece_idx,
+                piece_len - remainder_block_size,
+                remainder_block_size,
+            )))
+            .await?;
+        };
+        Ok(())
+    }
 }
 
 #[tokio::main]
@@ -196,69 +276,10 @@ async fn main() -> anyhow::Result<()> {
         Command::DownloadPiece(args) => {
             let torrent = read_torrent_file(args.torrent_path)?;
             let mut output_file = std::fs::File::create(args.output_file_path)?;
-            let piece_len = torrent.piece_len(args.piece_index);
             let response = torrent.tracker_peers().await?;
             let peer_ip = response.peers[0]; // use the first peer
             let mut peer = Peer::handshake_with(peer_ip, &torrent).await?;
-            println!("Waiting for bitfield.");
-            match peer.recv().await {
-                Ok(msg) => match msg {
-                    Message::Bitfield(_) => (), // Do nothing for now since we are guaranteed all peers have all pieces
-                    m => anyhow::bail!("Received an unexpected message: {m:?}"),
-                },
-                Err(e) => anyhow::bail!("Failed to receive bitfield message: {e}."),
-            }
-            println!("Sending interested message.");
-            peer.send(Message::Interested).await?;
-            println!("Waiting for unchoke message.");
-            match peer.recv().await {
-                Ok(msg) => match msg {
-                    Message::Unchoke => (),
-                    m => anyhow::bail!("Received an unexpected message: {m:?}"),
-                },
-                Err(e) => anyhow::bail!("Failed to receive unchoke message: {e}"),
-            }
-            println!("Requesting piece.");
-            let mut byte_idx = 0;
-            let remainder_block_size = piece_len % MAX_BLOCK_SIZE;
-            while byte_idx < piece_len - remainder_block_size {
-                peer.send(Message::Request(RequestMsg::new(
-                    args.piece_index,
-                    byte_idx,
-                    MAX_BLOCK_SIZE,
-                )))
-                .await?;
-                byte_idx += MAX_BLOCK_SIZE;
-            }
-            if remainder_block_size > 0 {
-                peer.send(Message::Request(RequestMsg::new(
-                    args.piece_index,
-                    piece_len - remainder_block_size,
-                    remainder_block_size,
-                )))
-                .await?;
-            }
-            println!("Receiving piece.");
-            let mut data = vec![0; piece_len as usize];
-            let mut blocks_received = 0;
-            let block_count = piece_len.div_ceil(MAX_BLOCK_SIZE);
-            while blocks_received < block_count {
-                match peer
-                    .recv()
-                    .await
-                    .context("Something went wrong while downloading a piece")?
-                {
-                    Message::Piece(piece) => {
-                        let block = piece.block();
-                        data[(piece.byte_idx() as usize)..][..block.len()].copy_from_slice(block);
-                        blocks_received += 1;
-                    }
-                    msg => {
-                        eprintln!("Unexpected message while downloading piece: {msg:?}");
-                        continue;
-                    }
-                }
-            }
+            let data = peer.download_piece(&torrent, args.piece_index).await?;
             output_file.write_all(&data)?;
         }
     }

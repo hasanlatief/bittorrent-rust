@@ -131,6 +131,10 @@ impl TorrentInfo {
                 .collect(),
         })
     }
+
+    pub(crate) fn piece_hash(&self, idx: u32) -> [u8; HASH_LEN] {
+        self.piece_hashes[idx as usize]
+    }
 }
 
 fn chunked_vec_in_place<T, const N: usize>(mut arr: Vec<T>) -> anyhow::Result<Vec<[T; N]>> {
