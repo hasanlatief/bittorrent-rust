@@ -1,6 +1,6 @@
 #![feature(string_from_utf8_lossy_owned)]
 
-use std::{io::Write, net::SocketAddr};
+use std::{fs::File, io::Write, net::SocketAddr, os::unix::fs::FileExt, sync::Arc};
 
 use nom::{IResult, Parser as _, bytes::streaming::take};
 
@@ -157,12 +157,8 @@ impl Peer {
         let info = PeerInfo::parse_from_connection(&mut read).await?;
         Ok(Peer { info, read, write })
     }
-    async fn download_piece(
-        &mut self,
-        torrent: &TorrentInfo,
-        piece_idx: u32,
-    ) -> anyhow::Result<Vec<u8>> {
-        let piece_len = torrent.piece_len(piece_idx);
+
+    async fn setup_download(&mut self) -> anyhow::Result<()> {
         match self
             .recv()
             .await
@@ -180,6 +176,15 @@ impl Peer {
             Message::Unchoke => (),
             m => anyhow::bail!("Received an unexpected message: {m:?}"),
         }
+        Ok(())
+    }
+
+    async fn download_piece(
+        &mut self,
+        torrent: &TorrentInfo,
+        piece_idx: u32,
+    ) -> anyhow::Result<Vec<u8>> {
+        let piece_len = torrent.piece_len(piece_idx);
         self.request_all_blocks(piece_idx, piece_len).await?;
         let piece = self.download_all_blocks(piece_len).await?;
         let piece_hash: [u8; HASH_LEN] = sha1::Sha1::digest(&piece).into();
@@ -242,7 +247,7 @@ impl Peer {
 async fn main() -> anyhow::Result<()> {
     let command = cli::parse();
     unsafe {
-        // makes the codecrafter tester show stderr because it stupidly swallows it by default
+        // makes the codecrafters tester show stderr because it stupidly swallows it by default
         libc::dup2(libc::STDOUT_FILENO, libc::STDERR_FILENO);
     }
     match command {
@@ -274,13 +279,64 @@ async fn main() -> anyhow::Result<()> {
             println!()
         }
         Command::DownloadPiece(args) => {
-            let torrent = read_torrent_file(args.torrent_path)?;
-            let mut output_file = std::fs::File::create(args.output_file_path)?;
+            let torrent = read_torrent_file(args.download_args.torrent_path)?;
+            let mut output_file = File::create(args.download_args.output_file_path)?;
             let response = torrent.tracker_peers().await?;
             let peer_ip = response.peers[0]; // use the first peer
             let mut peer = Peer::handshake_with(peer_ip, &torrent).await?;
+            peer.setup_download().await?;
             let data = peer.download_piece(&torrent, args.piece_index).await?;
             output_file.write_all(&data)?;
+        }
+        Command::Download(args) => {
+            let torrent = Arc::new(read_torrent_file(args.torrent_path)?);
+            let num_pieces = torrent.num_pieces();
+            let output_file = Arc::new(tokio::sync::Mutex::new(File::create(
+                args.output_file_path,
+            )?));
+            let response = torrent.tracker_peers().await?;
+            let (work_queue_tx, work_queue_rx) = async_channel::bounded(num_pieces as usize);
+            for i in 0..num_pieces {
+                work_queue_tx.send(i).await.unwrap();
+            }
+            let handles: Vec<_> = response
+                .peers
+                .into_iter()
+                .map(|peer_ip| {
+                    tokio::spawn({
+                        let tx = work_queue_tx.clone();
+                        let rx = work_queue_rx.clone();
+                        let torrent = Arc::clone(&torrent);
+                        let file = Arc::clone(&output_file);
+                        async move {
+                            let mut peer = Peer::handshake_with(peer_ip, torrent.as_ref()).await?;
+                            peer.setup_download().await?;
+                            loop {
+                                let Ok(piece_idx) = rx.try_recv() else {
+                                    return Result::<(), anyhow::Error>::Ok(());
+                                };
+                                match peer.download_piece(&torrent, piece_idx).await {
+                                    Ok(piece) => file
+                                        .lock()
+                                        .await
+                                        .write_all_at(
+                                            &piece,
+                                            (piece_idx * torrent.piece_len(0)) as u64,
+                                        )
+                                        .unwrap(),
+                                    Err(e) => {
+                                        eprintln!("{e}");
+                                        tx.send(piece_idx).await.unwrap();
+                                    }
+                                }
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.await??;
+            }
         }
     }
     Ok(())

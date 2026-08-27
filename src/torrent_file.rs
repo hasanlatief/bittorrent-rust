@@ -87,8 +87,12 @@ impl TorrentInfo {
         }
     }
 
+    pub(crate) fn num_pieces(&self) -> u32 {
+        self.piece_hashes.len() as u32
+    }
+
     pub(crate) fn piece_len(&self, piece_index: u32) -> u32 {
-        let num_pieces = self.piece_hashes.len() as u32;
+        let num_pieces = self.num_pieces();
         if piece_index == num_pieces - 1 {
             let full_pieces_len = self.piece_len * (num_pieces - 1);
             self.length - full_pieces_len

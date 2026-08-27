@@ -16,6 +16,7 @@ pub enum Command {
     Handshake(HandshakeArgs),
     #[command(alias = "download_piece")]
     DownloadPiece(DownloadPieceArgs),
+    Download(DownloadArgs),
 }
 
 #[derive(Args)]
@@ -41,10 +42,16 @@ pub struct HandshakeArgs {
 
 #[derive(Args)]
 pub struct DownloadPieceArgs {
+    #[command(flatten)]
+    pub download_args: DownloadArgs,
+    pub piece_index: u32,
+}
+
+#[derive(Args)]
+pub struct DownloadArgs {
     #[arg(short = 'o')]
     pub output_file_path: PathBuf,
     pub torrent_path: PathBuf,
-    pub piece_index: u32,
 }
 
 pub fn parse() -> Command {

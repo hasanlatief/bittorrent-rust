@@ -119,9 +119,9 @@ impl PieceMsg {
         result
     }
 
-    pub fn piece_idx(&self) -> u32 {
-        self.piece_idx
-    }
+    // pub fn piece_idx(&self) -> u32 {
+    //     self.piece_idx
+    // }
 
     pub fn byte_idx(&self) -> u32 {
         self.byte_idx
