@@ -1,12 +1,12 @@
-use crate::PEER_ID_LEN;
 use crate::bencode;
+use crate::peers::PEER_ID_LEN;
 use std::{net::SocketAddrV4, path::Path};
 
 use anyhow::Context as _;
 use percent_encoding::{NON_ALPHANUMERIC, percent_encode};
 use sha1::{Digest as _, Sha1};
 
-use super::{EXTENSIONS, HASH_LEN, PeerInfo};
+use super::{peers::EXTENSIONS, peers::HASH_LEN, peers::PeerInfo};
 
 const INFO: &[u8] = b"info";
 const LENGTH: &[u8] = b"length";
