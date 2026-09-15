@@ -18,6 +18,9 @@ pub(crate) const EXTENSION_LEN: usize = 8;
 pub(crate) const EXTENSIONS: [u8; EXTENSION_LEN] = [0; EXTENSION_LEN];
 pub(crate) const HASH_LEN: usize = 20;
 
+pub(crate) const SELF_PEER_ID: [u8; PEER_ID_LEN] = *b"idkICanPickAnything!";
+const PROTOCOL: &str = "BitTorrent protocol";
+
 pub(crate) struct PeerInfo {
     pub(crate) id: [u8; PEER_ID_LEN],
     pub(crate) info_hash: [u8; HASH_LEN],
@@ -34,6 +37,15 @@ impl PeerInfo {
         result.extend_from_slice(&self.info_hash);
         result.extend_from_slice(&self.id);
         result
+    }
+
+    pub(crate) fn self_info(torrent: &TorrentInfo) -> PeerInfo {
+        PeerInfo {
+            id: SELF_PEER_ID,
+            info_hash: torrent.info_hash(),
+            protocol: PROTOCOL.to_string(),
+            extension: EXTENSIONS,
+        }
     }
 
     pub(crate) fn parse(bytes: &[u8]) -> IResult<&[u8], PeerInfo> {
@@ -139,7 +151,7 @@ impl Peer {
             .connect(ip.into())
             .await?
             .into_split();
-        let self_info = torrent.self_peer_info();
+        let self_info = PeerInfo::self_info(torrent);
         let mut read = BufReader::new(peer_read);
         let mut write = BufWriter::new(peer_write);
         write.write_all(&self_info.as_handshake()).await?;

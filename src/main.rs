@@ -1,6 +1,6 @@
 #![feature(string_from_utf8_lossy_owned)]
 
-use std::{fs::File, io::Write, os::unix::fs::FileExt, sync::Arc};
+use std::{fs::File, io::Write, os::unix::fs::FileExt};
 
 mod bencode;
 
@@ -65,55 +65,45 @@ async fn main() -> anyhow::Result<()> {
             output_file.write_all(&data)?;
         }
         Command::Download(args) => {
-            let torrent = Arc::new(read_torrent_file(args.torrent_path)?);
+            let torrent = &read_torrent_file(args.torrent_path)?;
             let num_pieces = torrent.num_pieces();
-            let output_file = Arc::new(tokio::sync::Mutex::new(File::create(
-                args.output_file_path,
-            )?));
+            let output_file = &std::sync::Mutex::new(File::create(args.output_file_path)?);
             let response = torrent.tracker_peers().await?;
             let (work_queue_tx, work_queue_rx) = async_channel::bounded(num_pieces as usize);
             for i in 0..num_pieces {
                 work_queue_tx.send(i).await.unwrap();
             }
-            let task_handles: Vec<_> = response
-                .peers
-                .into_iter()
-                .map(|peer_ip| {
-                    tokio::spawn({
-                        let tx = work_queue_tx.clone();
-                        let rx = work_queue_rx.clone();
-                        let torrent = Arc::clone(&torrent);
-                        let file = Arc::clone(&output_file);
-                        async move {
-                            let mut peer = Peer::handshake_with(peer_ip, torrent.as_ref()).await?;
-                            let token = peer.setup_download().await?;
-                            loop {
-                                let Ok(piece_idx) = rx.try_recv() else {
-                                    return Result::<(), anyhow::Error>::Ok(());
-                                };
-                                match peer.download_piece(token, &torrent, piece_idx).await {
-                                    Ok(piece) => file
-                                        .lock()
-                                        .await
-                                        .write_all_at(
-                                            &piece,
-                                            (piece_idx * torrent.piece_len(0)) as u64,
-                                        )
-                                        .unwrap(),
-                                    Err(e) => {
-                                        eprintln!("{e}");
-                                        tx.send(piece_idx).await.unwrap();
-                                    }
+            tokio_scoped::scope(|scope| {
+                for peer_ip in response.peers.into_iter() {
+                    let tx = work_queue_tx.clone();
+                    let rx = work_queue_rx.clone();
+                    scope.spawn(async move {
+                        let Ok(mut peer) = Peer::handshake_with(peer_ip, torrent).await else {
+                            return;
+                        };
+                        let Ok(token) = peer.setup_download().await else {
+                            return;
+                        };
+                        loop {
+                            let Ok(piece_idx) = rx.try_recv() else {
+                                return;
+                            };
+                            match peer.download_piece(token, torrent, piece_idx).await {
+                                Ok(piece) => output_file
+                                    .lock()
+                                    .unwrap()
+                                    .write_all_at(&piece, (piece_idx * torrent.piece_len(0)) as u64)
+                                    .unwrap(),
+                                Err(e) => {
+                                    eprintln!("{e}");
+                                    tx.send(piece_idx).await.unwrap();
                                 }
                             }
                         }
-                    })
-                })
-                .collect();
-            for handle in task_handles {
-                handle.await??;
-            }
+                    });
+                }
+            });
         }
-    }
+    };
     Ok(())
 }
