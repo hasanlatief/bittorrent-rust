@@ -1,35 +1,16 @@
-[![progress-banner](https://backend.codecrafters.io/progress/bittorrent/73e0d0fa-aea5-4048-a392-d730a4130e0d)](https://app.codecrafters.io/users/LieutenantWaffles86?r=2qF)
+# BitTorrent Client (Rust)
 
-This is a starting point for Rust solutions to the
-["Build Your Own BitTorrent" Challenge](https://app.codecrafters.io/courses/bittorrent/overview).
+Async BitTorrent client built from scratch in Rust: custom bencode parser, HTTP tracker, peer wire protocol, and concurrent multi-peer downloads over Tokio.
 
-In this challenge, you’ll build a BitTorrent client that's capable of parsing a
-.torrent file and downloading a file from a peer. Along the way, we’ll learn
-about how torrent files are structured, HTTP trackers, BitTorrent’s Peer
-Protocol, pipelining and more.
+**Stack:** Tokio, nom, SHA-1 piece hashes, pipelined 16 KiB block requests, work-queue across all tracker peers (failed pieces requeued).
 
-**Note**: If you're viewing this repo on GitHub, head over to
-[codecrafters.io](https://codecrafters.io) to try the challenge.
+## Commands
 
-# Passing the first stage
-
-The entry point for your BitTorrent implementation is in `src/main.rs`. Study
-and uncomment the relevant code, then run the command below to execute the tests
-on our servers:
-
-```sh
-codecrafters submit
 ```
-
-Time to move on to the next stage!
-
-# Stage 2 & beyond
-
-Note: This section is for stages 2 and beyond.
-
-1. Ensure you have `cargo (1.96)` installed locally
-1. Run `./your_program.sh` to run your program, which is implemented in
-   `src/main.rs`. This command compiles your Rust project, so it might be slow
-   the first time you run it. Subsequent runs will be fast.
-1. Run `codecrafters submit` to submit your solution to CodeCrafters. Test
-   output will be streamed to your terminal.
+cargo run -- decode <bencoded>                          # bencode → JSON
+cargo run -- info <file.torrent>                        # tracker URL, length, info hash, piece hashes
+cargo run -- peers <file.torrent>                       # compact tracker announce → ip:port list
+cargo run -- handshake <file.torrent> <ip:port>         # TCP handshake, print peer ID
+cargo run -- download-piece -o <out> <file.torrent> <i> # one piece (SHA-1 verified)
+cargo run -- download -o <out> <file.torrent>           # full file, parallel peers
+```
